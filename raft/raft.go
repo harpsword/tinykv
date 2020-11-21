@@ -163,6 +163,16 @@ func newRaft(c *Config) *Raft {
 		panic(err.Error())
 	}
 	// Your Code Here (2A).
+	return &Raft{
+		id: c.ID,
+		Term: 1,
+		Vote: c.ID,
+		State: StateCandidate,
+		Lead: 0,
+		heartbeatTimeout: c.HeartbeatTick,
+		electionTimeout: c.ElectionTick,
+		RaftLog: newLog(c.Storage),
+	}
 	return nil
 }
 
