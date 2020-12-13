@@ -95,7 +95,11 @@ func NewMemoryStorage() *MemoryStorage {
 
 // InitialState implements the Storage interface.
 func (ms *MemoryStorage) InitialState() (pb.HardState, pb.ConfState, error) {
-	return ms.hardState, *ms.snapshot.Metadata.ConfState, nil
+	if ms.snapshot.Metadata == nil {
+		return ms.hardState, pb.ConfState{}, nil
+	} else {
+		return ms.hardState, *ms.snapshot.Metadata.ConfState, nil
+	}
 }
 
 // SetHardState saves the current HardState.

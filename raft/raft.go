@@ -165,10 +165,14 @@ func newRaft(c *Config) *Raft {
 		panic(err.Error())
 	}
 	// Your Code Here (2A).
+	hardState, _, err := c.Storage.InitialState()
+	if err != nil {
+		panic(err)
+	}
 	raftNode := &Raft{
 		id:               c.ID,
-		Term:             0,
-		Vote:             None,
+		Term:             hardState.Term,
+		Vote:             hardState.Vote,
 		State:            StateFollower,
 		Lead:             None,
 		heartbeatTimeout: c.HeartbeatTick,
@@ -448,8 +452,11 @@ func (r *Raft) stepLeader(m pb.Message) (err error) {
 	case pb.MessageType_MsgAppendResponse:
 		if m.Reject {
 			r.Prs[m.From].Next = max(r.Prs[m.From].Next-1, 0)
+			r.sendAppend(m.From)
 		} else {
-			r.Prs[m.From].Next = min(r.Prs[m.From].Next+1, r.RaftLog.LastIndex()+1)
+			//r.Prs[m.From].Next = min(r.Prs[m.From].Next+1, r.RaftLog.LastIndex()+1)
+			//r.Prs[m.From].Match = r.Prs[m.From].Next - 1
+			r.Prs[m.From].Next = min(m.Index+1, r.RaftLog.LastIndex()+1)
 			r.Prs[m.From].Match = r.Prs[m.From].Next - 1
 			r.CommitEntries()
 		}
@@ -458,6 +465,8 @@ func (r *Raft) stepLeader(m pb.Message) (err error) {
 			entry.Term = r.Term
 			r.RaftLog.Append(entry)
 		}
+		r.Prs[r.id].Next = r.RaftLog.LastIndex() + 1
+		r.Prs[r.id].Match = r.Prs[r.id].Next - 1
 		for id, _ := range r.Prs {
 			if id != r.id {
 				// TODO: change to async
@@ -476,8 +485,24 @@ func (r *Raft) stepLeader(m pb.Message) (err error) {
 
 func (r *Raft) CommitEntries() {
 	for commitIndex := r.RaftLog.LastIndex(); commitIndex > r.RaftLog.committed; commitIndex-- {
+		term, err := r.RaftLog.Term(commitIndex)
+		if err != nil {
+			panic(err)
+		}
+		if term < r.Term {
+			// 只commit当前term的log entry
+			break
+		}
+
 		if r.IsHalfMatched(commitIndex) {
 			r.RaftLog.CommitTo(commitIndex)
+			// 给其他节点发消息，表示可以commit了
+			r.Step(pb.Message{
+				From:    r.id,
+				To:      r.id,
+				MsgType: pb.MessageType_MsgPropose,
+				Entries: []*pb.Entry{},
+			})
 			return
 		}
 	}
@@ -537,7 +562,11 @@ func (r *Raft) stepCandidate(m pb.Message) (err error) {
 			}
 		}
 		if count*2 > all {
+			// 判断是否拿到了一半的票
 			r.becomeLeader()
+		} else if all == len(r.votes) {
+			// 当所有node投票完成之后，还没有拿到一半的票，转变为Follower
+			r.becomeFollower(r.Term, None)
 		}
 	case pb.MessageType_MsgRequestVote:
 		r.handleRequestVote(m)
@@ -548,16 +577,16 @@ func (r *Raft) stepCandidate(m pb.Message) (err error) {
 func (r *Raft) handleRequestVote(m pb.Message) {
 	// 来自candidate的请求投票
 	if r.State == StateCandidate || r.State == StateLeader {
-		r.sendResponse(pb.MessageType_MsgRequestVoteResponse, m.From, true)
+		r.sendResponse(pb.MessageType_MsgRequestVoteResponse, m.From, true, 0)
 		return
 	}
 
 	if (r.Vote == None || r.Vote == m.From) && r.Term <= m.Term && r.isLogUpToDate(m.LogTerm, m.Index) {
 		// 判断是否能给candidate投票
 		r.Vote = m.From
-		r.sendResponse(pb.MessageType_MsgRequestVoteResponse, m.From, false)
+		r.sendResponse(pb.MessageType_MsgRequestVoteResponse, m.From, false, 0)
 	} else {
-		r.sendResponse(pb.MessageType_MsgRequestVoteResponse, m.From, true)
+		r.sendResponse(pb.MessageType_MsgRequestVoteResponse, m.From, true, 0)
 	}
 }
 
@@ -569,24 +598,30 @@ func (r *Raft) isLogUpToDate(mTerm uint64, mIndex uint64) bool {
 func (r *Raft) handleAppendEntries(m pb.Message) {
 	// Your Code Here (2A).
 
-	// 处理log优先，内部会先进行校验，后添加到entries中
-	r.RaftLog.AppendSlice(m.Entries)
-
-	if m.Commit > r.RaftLog.committed {
-		r.RaftLog.CommitTo(min(m.Commit, r.RaftLog.LastIndex()))
-	}
+	r.Lead = m.From
 
 	rPrevTerm, err := r.RaftLog.Term(m.Index)
 	if err != nil {
-		r.sendResponse(pb.MessageType_MsgAppendResponse, m.From, true)
+		r.sendResponse(pb.MessageType_MsgAppendResponse, m.From, true, 0)
 		return
 	}
 	if rPrevTerm != m.LogTerm {
-		r.sendResponse(pb.MessageType_MsgAppendResponse, m.From, true)
+		r.sendResponse(pb.MessageType_MsgAppendResponse, m.From, true, 0)
 		return
 	}
 
-	r.sendResponse(pb.MessageType_MsgAppendResponse, m.From, false)
+	// 内部会先进行校验，后添加到entries中
+	r.RaftLog.AppendSlice(m.Entries)
+
+	if m.Commit > r.RaftLog.committed {
+		newCommitIndex := m.Index
+		if len(m.Entries) > 0 {
+			newCommitIndex = m.Entries[len(m.Entries)-1].Index
+		}
+		r.RaftLog.CommitTo(min(m.Commit, newCommitIndex))
+	}
+	// 当返回AppendResponse时，reject=false，此时 Index表示 新的Match index
+	r.sendResponse(pb.MessageType_MsgAppendResponse, m.From, false, r.RaftLog.LastIndex())
 
 }
 
@@ -617,12 +652,13 @@ func (r *Raft) removeNode(id uint64) {
 	// Your Code Here (3A).
 }
 
-func (r *Raft) sendResponse(msgType pb.MessageType, to uint64, reject bool) {
+func (r *Raft) sendResponse(msgType pb.MessageType, to uint64, reject bool, index uint64) {
 	r.msgs = append(r.msgs, pb.Message{
 		MsgType: msgType,
 		To:      to,
 		From:    r.id,
 		Term:    r.Term,
 		Reject:  reject,
+		Index:   index,
 	})
 }

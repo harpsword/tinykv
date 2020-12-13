@@ -17,6 +17,7 @@ package raft
 import (
 	"errors"
 	"fmt"
+	"github.com/jinzhu/copier"
 	pb "github.com/pingcap-incubator/tinykv/proto/pkg/eraftpb"
 )
 
@@ -60,10 +61,14 @@ type RaftLog struct {
 // to the state that it just commits and applies the latest snapshot.
 func newLog(storage Storage) *RaftLog {
 	// Your Code Here (2A).
+	hardState, _, err := storage.InitialState()
+	if err != nil {
+		panic(err)
+	}
 	stabled, _ := storage.LastIndex()
 	log := &RaftLog{
 		storage:   storage,
-		committed: 0,
+		committed: hardState.Commit,
 		applied:   0,
 		stabled:   stabled,
 	}
@@ -88,18 +93,21 @@ func (l *RaftLog) Check(entries []*pb.Entry) {
 	l.stabled = min(l.stabled, l.LastIndex())
 }
 
+// AppendSlice 增加entries到log中
 func (l *RaftLog) AppendSlice(entries []*pb.Entry) {
 	l.Check(entries)
 	indexNow := l.LastIndex() + 1
 	for _, entry := range entries {
-		if entry.Index <= 0 {
-			entry.Index = indexNow
+		var tmpEntry pb.Entry
+		copier.Copy(&tmpEntry, entry)
+		if tmpEntry.Index <= 0 {
+			tmpEntry.Index = indexNow
 		}
-		if entry.Index < indexNow {
-			// 已经有的log
+		if tmpEntry.Index < indexNow {
+			// 已经有的log，前面已经check过了，所以一定是相同的
 			continue
 		}
-		l.entries = append(l.entries, *entry)
+		l.entries = append(l.entries, tmpEntry)
 		indexNow++
 	}
 }
@@ -207,7 +215,8 @@ func (l *RaftLog) Term(i uint64) (uint64, error) {
 		return 0, err
 	}
 	if i > storageLastIndex {
-		return l.entries[i-storageLastIndex-1].Term, nil
+		firstIndex := l.entries[0].Index
+		return l.entries[i-firstIndex].Term, nil
 	}
 	return l.storage.Term(i)
 }
@@ -284,8 +293,8 @@ func (l *RaftLog) Entries(lo, hi uint64) ([]*pb.Entry, error) {
 
 func (l *RaftLog) EntrySlice2EntryPointerSlice(entries []pb.Entry) []*pb.Entry {
 	entryPointSlice := make([]*pb.Entry, 0, len(entries))
-	for _, v := range entries {
-		entryPointSlice = append(entryPointSlice, &v)
+	for id, _ := range entries {
+		entryPointSlice = append(entryPointSlice, &entries[id])
 	}
 	return entryPointSlice
 }
