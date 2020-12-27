@@ -55,6 +55,8 @@ type RaftLog struct {
 	pendingSnapshot *pb.Snapshot
 
 	// Your Data Here (2A).
+	lastIndex uint64
+	offset    uint64 // snapShot.Metadata.Index + 1
 }
 
 // newLog returns log using the given storage. It recovers the log
@@ -71,6 +73,8 @@ func newLog(storage Storage) *RaftLog {
 		committed: hardState.Commit,
 		applied:   0,
 		stabled:   stabled,
+		lastIndex: stabled,
+		offset:    1,
 	}
 	log.entries, _ = storage.Entries(1, stabled+1)
 	return log
@@ -93,6 +97,11 @@ func (l *RaftLog) Check(entries []*pb.Entry) {
 	l.stabled = min(l.stabled, l.LastIndex())
 }
 
+func (l *RaftLog) appendEntries(entry *pb.Entry) {
+	l.entries = append(l.entries, *entry)
+	l.lastIndex++
+}
+
 // AppendSlice 增加entries到log中
 func (l *RaftLog) AppendSlice(entries []*pb.Entry) {
 	l.Check(entries)
@@ -107,7 +116,8 @@ func (l *RaftLog) AppendSlice(entries []*pb.Entry) {
 			// 已经有的log，前面已经check过了，所以一定是相同的
 			continue
 		}
-		l.entries = append(l.entries, tmpEntry)
+		//l.entries = append(l.entries, tmpEntry)
+		l.appendEntries(&tmpEntry)
 		indexNow++
 	}
 }
@@ -115,20 +125,6 @@ func (l *RaftLog) AppendSlice(entries []*pb.Entry) {
 func (l *RaftLog) Append(entry *pb.Entry) {
 	l.AppendSlice([]*pb.Entry{entry})
 }
-
-//func (l *RaftLog) Append(entry *pb.Entry) {
-//	if entry.Index > 0 && entry.Index <= l.committed {
-//		// 带有有效index的entry，不应该修改已经commit的内容
-//		return
-//	}
-//	if entry.Index <= l.LastIndex() {
-//		// 更新已经有的
-//		l.UpdateIndex(entry)
-//		return
-//	}
-//	entry.Index = l.LastIndex() + 1
-//	l.entries = append(l.entries, *entry)
-//}
 
 func (l *RaftLog) UpdateIndex(entry *pb.Entry) {
 	for id, entry2 := range l.entries {
@@ -160,6 +156,7 @@ func (l *RaftLog) Delete(index uint64) {
 	for id, entry := range l.entries {
 		if entry.Index == index {
 			l.entries = l.entries[:id]
+			l.lastIndex = index - 1
 			return
 		}
 	}
@@ -190,12 +187,11 @@ func (l *RaftLog) nextEnts() (ents []pb.Entry) {
 // LastIndex return the last index of the log entries
 func (l *RaftLog) LastIndex() uint64 {
 	// Your Code Here (2A).
-	if len(l.entries) > 0 {
-		return l.entries[len(l.entries)-1].Index
-	}
-	return 0
-	//index, _ := l.storage.LastIndex()
-	//return index
+	//if len(l.entries) > 0 {
+	//	return l.entries[len(l.entries)-1].Index
+	//}
+	//return 0
+	return l.lastIndex
 }
 
 func (l *RaftLog) LastTerm() uint64 {
@@ -215,10 +211,26 @@ func (l *RaftLog) Term(i uint64) (uint64, error) {
 		return 0, err
 	}
 	if i > storageLastIndex {
-		firstIndex := l.entries[0].Index
-		return l.entries[i-firstIndex].Term, nil
+		// 查看 entries中的数据
+		//firstIndex := l.entries[0].Index
+		//return l.entries[i-firstIndex].Term, nil
+		return l.TermOfEntries(i)
 	}
 	return l.storage.Term(i)
+}
+
+func (l *RaftLog) TermOfEntries(i uint64) (uint64, error) {
+	if i < l.offset {
+		if l.pendingSnapshot != nil && l.pendingSnapshot.Metadata.Index == i {
+			return l.pendingSnapshot.Metadata.Term, nil
+		}
+		return 0, errors.New("too large index for getting Term")
+	}
+	lastIndex := l.LastIndex()
+	if i > lastIndex {
+		return 0, errors.New("too large index for getting Term")
+	}
+	return l.entries[i-l.offset].Term, nil
 }
 
 // isLogUpToDate 判断(mTerm, mIndex)是否比 l 要更新或者一样新
@@ -305,18 +317,39 @@ func (l *RaftLog) CommitTo(index uint64) {
 	}
 }
 
-func (l *RaftLog) AppliedToSM() {
-	if l.committed > l.applied {
-		l.applied = l.committed
+func (l *RaftLog) AppliedToSM(i uint64) {
+	if i > l.applied {
+		l.applied = i
 	}
 }
 
-//func (l *RaftLog) commitTo(tocommit uint64) {
-//	// never decrease commit
-//	if l.committed < tocommit {
-//		if l.LastIndex() < tocommit {
-//			//l.logger.Panicf("tocommit(%d) is out of range [lastIndex(%d)]. Was the raft log corrupted, truncated, or lost?", tocommit, l.lastIndex())
-//		}
-//		l.committed = tocommit
-//	}
-//}
+func (l *RaftLog) matchTerm(i, term uint64) bool {
+	t, err := l.Term(i)
+	if err != nil {
+		return false
+	}
+	return t == term
+}
+
+func (l *RaftLog) restore(s *pb.Snapshot) {
+	l.committed = s.Metadata.Index
+	l.pendingSnapshot = s
+	l.entries = nil
+	l.stabled = s.Metadata.Index
+	l.lastIndex = s.Metadata.Index
+	l.offset = s.Metadata.Index + 1
+}
+
+func (l *RaftLog) hasPendingSnapshot() bool {
+	return l.pendingSnapshot != nil
+}
+
+func (l *RaftLog) hasNextEnts() bool {
+	return l.committed > l.applied
+}
+
+func (l *RaftLog) stableSnapTo(index uint64) {
+	if l.pendingSnapshot != nil && l.pendingSnapshot.Metadata.Index == index {
+		l.pendingSnapshot = nil
+	}
+}

@@ -16,7 +16,7 @@ package raft
 
 import (
 	"errors"
-
+	"github.com/pingcap-incubator/tinykv/log"
 	pb "github.com/pingcap-incubator/tinykv/proto/pkg/eraftpb"
 )
 
@@ -180,7 +180,7 @@ func newRaft(c *Config) *Raft {
 		RaftLog:          newLog(c.Storage),
 		Prs:              map[uint64]*Progress{},
 		votes:            map[uint64]bool{},
-		msgs:             []pb.Message{},
+		msgs:             nil,
 		heartbeatElapsed: 0,
 		electionElapsed:  0,
 		leadTransferee:   None,
@@ -211,7 +211,10 @@ func (r *Raft) sendAppend(to uint64) bool {
 	preLogIndex := progress.Next - 1
 	preLogTerm, err := r.RaftLog.Term(preLogIndex)
 	if err != nil {
-		panic(err.Error())
+		// 有Error，很有可能 preLogIndex对应的log已经被压缩了，可以采用SnapShot的方式
+		// TODO
+		r.sendSnapShot(to)
+		return true
 	}
 	newMsg := pb.Message{
 		MsgType: pb.MessageType_MsgAppend,
@@ -229,7 +232,27 @@ func (r *Raft) sendAppend(to uint64) bool {
 		}
 	}
 	r.msgs = append(r.msgs, newMsg)
-	return false
+	return true
+}
+
+func (r *Raft) sendSnapShot(to uint64) {
+	// TODO 需要填充数据
+	r.msgs = append(r.msgs, pb.Message{
+		MsgType: pb.MessageType_MsgSnapshot,
+		To:      to,
+		From:    r.id,
+		Term:    r.Term,
+		Snapshot: &pb.Snapshot{
+			Data: []byte{},
+			Metadata: &pb.SnapshotMetadata{
+				Term:  r.RaftLog.LastTerm(),
+				Index: r.RaftLog.LastIndex(),
+				ConfState: &pb.ConfState{
+					Nodes: nodes(r),
+				},
+			},
+		},
+	})
 }
 
 // sendHeartbeat sends a heartbeat RPC to the given peer.
@@ -300,6 +323,14 @@ func (r *Raft) becomeCandidate() {
 	r.votes[r.id] = true
 }
 
+func (r *Raft) ResetHeartBeat() {
+	r.Vote = None
+	r.ResetVotes()
+	r.electionElapsed = 0
+	r.heartbeatElapsed = 0
+	r.resetRandomizedElectionTimeout()
+}
+
 func (r *Raft) Reset(term uint64) {
 	if r.Term != term {
 		r.Term = term
@@ -331,19 +362,10 @@ func (r *Raft) becomeLeader() {
 	r.Reset(r.Term)
 	r.State = StateLeader
 
-	//r.msgs = append(r.msgs, pb.Message{
-	//	MsgType: pb.MessageType_MsgBeat,
-	//	To:      r.id,
-	//	From:    r.id,
-	//})
 	for id, _ := range r.Prs {
 		r.Prs[id].Next = r.RaftLog.LastIndex() + 1
 		r.Prs[id].Match = 0
 	}
-	//r.RaftLog.Append(&pb.Entry{
-	//	Index: r.RaftLog.LastIndex() + 1,
-	//	Term:  r.Term,
-	//})
 	r.Step(pb.Message{
 		From:    r.id,
 		To:      r.id,
@@ -378,16 +400,15 @@ func (r *Raft) Step(m pb.Message) error {
 				From:    r.id,
 				To:      m.From,
 			})
-			return nil
-		case pb.MessageType_MsgAppend:
+		case pb.MessageType_MsgAppend, pb.MessageType_MsgSnapshot:
 			r.msgs = append(r.msgs, pb.Message{
 				MsgType: pb.MessageType_MsgAppendResponse,
 				Term:    r.Term,
 				From:    r.id,
 				To:      m.From,
 			})
-			return nil
 		}
+		return nil
 	}
 	// 对于m.Term > r.Term的情况，r.Term=m.Term,并且State为Follower
 	// 对于m.Term < r.Term的情况，部分已经处理
@@ -425,6 +446,7 @@ func (r *Raft) hup() {
 		return
 	}
 	r.becomeCandidate()
+	// 只有一个节点，不需要进行选举
 	if len(r.Prs) == 1 {
 		r.becomeLeader()
 		return
@@ -451,13 +473,15 @@ func (r *Raft) stepLeader(m pb.Message) (err error) {
 	case pb.MessageType_MsgHeartbeatResponse:
 	case pb.MessageType_MsgAppendResponse:
 		if m.Reject {
+			// 进度不同步，Next-1，继续发送Append消息
 			r.Prs[m.From].Next = max(r.Prs[m.From].Next-1, 0)
 			r.sendAppend(m.From)
 		} else {
-			//r.Prs[m.From].Next = min(r.Prs[m.From].Next+1, r.RaftLog.LastIndex()+1)
-			//r.Prs[m.From].Match = r.Prs[m.From].Next - 1
+			// 存在 m.Index < r.RaftLog.LastIndex()的情况，即Follower还没有
+			// 同步Leader的所有Log，虽然我觉得当m.Reject=False时不应该有这种情况
 			r.Prs[m.From].Next = min(m.Index+1, r.RaftLog.LastIndex()+1)
 			r.Prs[m.From].Match = r.Prs[m.From].Next - 1
+			// 尝试Commit
 			r.CommitEntries()
 		}
 	case pb.MessageType_MsgPropose:
@@ -493,7 +517,7 @@ func (r *Raft) CommitEntries() {
 			// 只commit当前term的log entry
 			break
 		}
-
+		// 判断是否半数已经Match
 		if r.IsHalfMatched(commitIndex) {
 			r.RaftLog.CommitTo(commitIndex)
 			// 给其他节点发消息，表示可以commit了
@@ -535,6 +559,8 @@ func (r *Raft) stepFollower(m pb.Message) (err error) {
 		r.handleHeartbeat(m)
 	case pb.MessageType_MsgRequestVote:
 		r.handleRequestVote(m)
+	case pb.MessageType_MsgSnapshot:
+		r.handleSnapshot(m)
 	}
 	return
 }
@@ -550,6 +576,9 @@ func (r *Raft) stepCandidate(m pb.Message) (err error) {
 	case pb.MessageType_MsgAppend:
 		r.becomeFollower(m.Term, m.From)
 		r.handleAppendEntries(m)
+	case pb.MessageType_MsgSnapshot:
+		r.becomeFollower(m.Term, m.From)
+		r.handleSnapshot(m)
 	case pb.MessageType_MsgRequestVoteResponse:
 		// 检查票数
 		r.votes[m.From] = !m.Reject
@@ -622,12 +651,13 @@ func (r *Raft) handleAppendEntries(m pb.Message) {
 	}
 	// 当返回AppendResponse时，reject=false，此时 Index表示 新的Match index
 	r.sendResponse(pb.MessageType_MsgAppendResponse, m.From, false, r.RaftLog.LastIndex())
-
 }
 
 // handleHeartbeat handle Heartbeat RPC request
 func (r *Raft) handleHeartbeat(m pb.Message) {
 	// Your Code Here (2A).
+	// 只有m.Term=r.Term这一种情况
+	r.ResetHeartBeat()
 	r.becomeFollower(m.Term, m.From)
 	r.msgs = append(r.msgs, pb.Message{
 		MsgType: pb.MessageType_MsgHeartbeatResponse,
@@ -640,6 +670,66 @@ func (r *Raft) handleHeartbeat(m pb.Message) {
 // handleSnapshot handle Snapshot RPC request
 func (r *Raft) handleSnapshot(m pb.Message) {
 	// Your Code Here (2C).
+	if r.restore(m.Snapshot) {
+		r.msgs = append(r.msgs, pb.Message{To: m.From, MsgType: pb.MessageType_MsgAppendResponse, Index: r.RaftLog.LastIndex()})
+	} else {
+		r.msgs = append(r.msgs, pb.Message{To: m.From, MsgType: pb.MessageType_MsgAppendResponse, Index: r.RaftLog.committed})
+	}
+}
+
+// restore recovers the state machine from a snapshot. It restores the log and the
+// configuration of state machine. If this method returns false, the snapshot was
+// ignored, either because it was obsolete or because of an error.
+func (r *Raft) restore(s *pb.Snapshot) bool {
+	if s.Metadata == nil || s.Metadata.ConfState == nil {
+		return false
+	}
+	if s.Metadata.Index <= r.RaftLog.committed {
+		return false
+	}
+	if r.State != StateFollower {
+		// This is defense-in-depth: if the leader somehow ended up applying a
+		// snapshot, it could move into a new term without moving into a
+		// follower state. This should never fire, but if it did, we'd have
+		// prevented damage by returning early, so log only a loud warning.
+		//
+		// At the time of writing, the instance is guaranteed to be in follower
+		// state when this method is called.
+		r.becomeFollower(r.Term+1, None)
+		return false
+	}
+	// 检查r.id是否在 snapshot中
+	found := false
+	cs := s.Metadata.ConfState
+	for _, uid := range cs.Nodes {
+		if uid == r.id {
+			found = true
+			break
+		}
+	}
+	if !found {
+		return false
+	}
+
+	if r.RaftLog.matchTerm(s.Metadata.Index, s.Metadata.Term) {
+		r.RaftLog.CommitTo(s.Metadata.Index)
+		return false
+	}
+
+	r.RaftLog.restore(s)
+	for _, uid := range cs.Nodes {
+		if _, ok := r.Prs[uid]; !ok {
+			r.Prs[uid] = &Progress{
+				Match: 0,
+				Next:  r.RaftLog.LastIndex() + 1,
+			}
+			r.votes[uid] = false
+		}
+		// 更新Next到至少Index一样大
+		r.Prs[uid].Next = min(r.Prs[uid].Next, s.Metadata.Index)
+	}
+
+	return true
 }
 
 // addNode add a new node to raft group
@@ -661,4 +751,37 @@ func (r *Raft) sendResponse(msgType pb.MessageType, to uint64, reject bool, inde
 		Reject:  reject,
 		Index:   index,
 	})
+}
+
+// Ready
+func (r *Raft) softState() *SoftState {
+	return &SoftState{Lead: r.Lead, RaftState: r.State}
+}
+
+func (r *Raft) hardState() pb.HardState {
+	return pb.HardState{
+		Term:   r.Term,
+		Vote:   r.Vote,
+		Commit: r.RaftLog.committed,
+	}
+}
+
+func (r *Raft) advance(rd Ready) {
+	if n := len(rd.CommittedEntries); n > 0 {
+		newApplied := rd.CommittedEntries[n-1].Index
+		if newApplied < r.RaftLog.applied || newApplied > r.RaftLog.committed {
+			log.Panicf("[advance] new applied index %d is not in range [%d, %d]",
+				newApplied, r.RaftLog.applied, r.RaftLog.committed)
+		}
+		r.RaftLog.AppliedToSM(newApplied)
+	}
+	if len(rd.Entries) > 0 {
+		index := rd.Entries[len(rd.Entries)-1].Index
+		r.RaftLog.entries = r.RaftLog.entries[index+1-r.RaftLog.offset:]
+		r.RaftLog.offset = index + 1
+		r.RaftLog.stabled = index
+	}
+	if !IsEmptySnap(&rd.Snapshot) {
+		r.RaftLog.stableSnapTo(rd.Snapshot.Metadata.Index)
+	}
 }
